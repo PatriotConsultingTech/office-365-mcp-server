@@ -8,7 +8,9 @@ const path = require('path');
 const { ensureAuthenticated } = require('../auth');
 const { callGraphAPI } = require('../utils/graph-api');
 const { safeTool } = require('../utils/errors');
+const { validateId } = require('../utils/validate');
 const config = require('../config');
+const { enforceMailPolicy, recordSideEffect } = require('../policy');
 
 // Submodule imports
 const { handleEmailSearch } = require('./search');
@@ -17,6 +19,243 @@ const { handleEmailRules } = require('./rules');
 const { handleEmailCategories } = require('./categories');
 const { getFocusedInbox } = require('./focused');
 const { convertSharePointUrlToLocal, downloadEmbeddedAttachment, cleanupOldAttachments } = require('./attachments');
+
+// ============== ATTACHMENT HELPERS ==============
+
+/**
+ * Read local file paths and build Graph API fileAttachment objects.
+ * Returns array of { "@odata.type": "#microsoft.graph.fileAttachment", name, contentType, contentBytes }.
+ * Files must be < 3 MB each (Graph API inline attachment limit).
+ */
+const MIME_MAP = {
+  '.pdf': 'application/pdf', '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.csv': 'text/csv', '.txt': 'text/plain', '.html': 'text/html',
+  '.zip': 'application/zip', '.json': 'application/json', '.xml': 'application/xml',
+};
+
+function buildFileAttachments(filePaths) {
+  if (!filePaths || !Array.isArray(filePaths) || filePaths.length === 0) return [];
+  return filePaths.map(fp => {
+    const resolved = path.resolve(fp);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Attachment file not found: ${fp}`);
+    }
+    const stats = fs.statSync(resolved);
+    if (stats.size > 3 * 1024 * 1024) {
+      throw new Error(`Attachment too large (${(stats.size / 1024 / 1024).toFixed(1)} MB, max 3 MB): ${path.basename(resolved)}`);
+    }
+    const ext = path.extname(resolved).toLowerCase();
+    const content = fs.readFileSync(resolved);
+    return {
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: path.basename(resolved),
+      contentType: MIME_MAP[ext] || 'application/octet-stream',
+      contentBytes: content.toString('base64')
+    };
+  });
+}
+
+function normalizeEmailAddress(address) {
+  return String(address || '').trim().toLowerCase();
+}
+
+function recipientAddress(recipient) {
+  if (!recipient) return null;
+  if (typeof recipient === 'string') return recipient;
+  return recipient.emailAddress?.address || recipient.address || null;
+}
+
+function recipientName(recipient) {
+  if (!recipient || typeof recipient === 'string') return null;
+  return recipient.emailAddress?.name || recipient.name || null;
+}
+
+function addUniqueRecipient(recipients, seenAddresses, recipient, selfAddresses = new Set()) {
+  const address = recipientAddress(recipient);
+  const normalized = normalizeEmailAddress(address);
+  if (!normalized || selfAddresses.has(normalized) || seenAddresses.has(normalized)) {
+    return;
+  }
+
+  const emailAddress = { address };
+  const name = recipientName(recipient);
+  if (name) {
+    emailAddress.name = name;
+  }
+
+  recipients.push({ emailAddress });
+  seenAddresses.add(normalized);
+}
+
+function addUniqueRecipients(recipients, seenAddresses, sourceRecipients, selfAddresses = new Set()) {
+  const items = Array.isArray(sourceRecipients) ? sourceRecipients : [sourceRecipients];
+  for (const recipient of items) {
+    addUniqueRecipient(recipients, seenAddresses, recipient, selfAddresses);
+  }
+}
+
+function recipientsFromParam(value, selfAddresses = new Set()) {
+  const recipients = [];
+  const seenAddresses = new Set();
+  addUniqueRecipients(recipients, seenAddresses, value, selfAddresses);
+  return recipients;
+}
+
+function buildReplySubject(subject) {
+  const originalSubject = subject || '';
+  return /^\s*re\s*:/i.test(originalSubject) ? originalSubject : `Re: ${originalSubject}`;
+}
+
+function isReplyActionRoutingError(error) {
+  const graphError = error?.graphError || {};
+  const details = [
+    error?.message,
+    graphError.code,
+    graphError.message,
+    graphError.innerError?.code,
+    graphError.innerError?.message
+  ].filter(Boolean).join(' ');
+
+  if (!/Mailbox move in progress|Cross Server access is not allowed|ErrorMailboxMoveInProgress/i.test(details)) {
+    return false;
+  }
+
+  return error?.statusCode === 503 ||
+    graphError.statusCode === 503 ||
+    /status\s+503/i.test(String(error?.message || ''));
+}
+
+async function getMailboxOwnerAddresses(accessToken, mailbox) {
+  const addresses = new Set();
+  if (mailbox && mailbox !== 'me') {
+    addresses.add(normalizeEmailAddress(mailbox));
+    return addresses;
+  }
+
+  try {
+    const profile = await callGraphAPI(accessToken, 'GET', 'me', null, {
+      $select: 'mail,userPrincipalName'
+    });
+    if (profile.mail) addresses.add(normalizeEmailAddress(profile.mail));
+    if (profile.userPrincipalName) addresses.add(normalizeEmailAddress(profile.userPrincipalName));
+  } catch (error) {
+    console.error('[EMAIL] Could not resolve current mailbox owner for reply fallback:', error.message);
+  }
+
+  return addresses;
+}
+
+async function fetchReplySourceMessage(accessToken, prefix, emailId) {
+  return await callGraphAPI(
+    accessToken,
+    'GET',
+    `${prefix}/messages/${emailId}`,
+    null,
+    {
+      $select: 'subject,from,sender,replyTo,toRecipients,ccRecipients,internetMessageId,conversationId'
+    }
+  );
+}
+
+function buildFallbackReplyRecipients(originalMessage, params, selfAddresses) {
+  let toRecipients;
+  let ccRecipients;
+
+  if (params.to) {
+    toRecipients = recipientsFromParam(params.to, selfAddresses);
+  } else {
+    toRecipients = [];
+    const toSeen = new Set();
+    addUniqueRecipient(toRecipients, toSeen, originalMessage.sender || originalMessage.from, selfAddresses);
+    addUniqueRecipients(toRecipients, toSeen, originalMessage.replyTo || [], selfAddresses);
+    if (params.replyAll) {
+      addUniqueRecipients(toRecipients, toSeen, originalMessage.toRecipients || [], selfAddresses);
+    }
+  }
+
+  if (params.cc) {
+    ccRecipients = recipientsFromParam(params.cc, selfAddresses);
+  } else {
+    ccRecipients = [];
+    if (params.replyAll) {
+      const ccSeen = new Set(toRecipients.map(r => normalizeEmailAddress(r.emailAddress?.address)));
+      addUniqueRecipients(ccRecipients, ccSeen, originalMessage.ccRecipients || [], selfAddresses);
+    }
+  }
+
+  return { toRecipients, ccRecipients };
+}
+
+async function sendReplyViaDraftFallback(accessToken, params, prefix, fileAttachments = []) {
+  console.error('[EMAIL] Reply action hit mailbox routing error; using draft-send fallback');
+
+  const [originalMessage, selfAddresses] = await Promise.all([
+    fetchReplySourceMessage(accessToken, prefix, params.emailId),
+    getMailboxOwnerAddresses(accessToken, params.mailbox)
+  ]);
+
+  const { toRecipients, ccRecipients } = buildFallbackReplyRecipients(originalMessage, params, selfAddresses);
+  if (toRecipients.length === 0) {
+    throw new Error('Unable to determine reply recipients for draft-send fallback');
+  }
+
+  const draftMessage = {
+    subject: buildReplySubject(originalMessage.subject),
+    body: {
+      contentType: 'HTML',
+      content: wrapHtmlBody(params.body)
+    },
+    toRecipients
+  };
+
+  if (ccRecipients.length > 0) {
+    draftMessage.ccRecipients = ccRecipients;
+  }
+
+  if (originalMessage.internetMessageId) {
+    draftMessage.internetMessageHeaders = [
+      { name: 'In-Reply-To', value: originalMessage.internetMessageId },
+      { name: 'References', value: originalMessage.internetMessageId }
+    ];
+  }
+
+  const draft = await callGraphAPI(
+    accessToken,
+    'POST',
+    `${prefix}/messages`,
+    draftMessage,
+    null
+  );
+
+  for (const attachment of fileAttachments) {
+    await callGraphAPI(
+      accessToken,
+      'POST',
+      `${prefix}/messages/${draft.id}/attachments`,
+      attachment,
+      null
+    );
+  }
+
+  await callGraphAPI(
+    accessToken,
+    'POST',
+    `${prefix}/messages/${draft.id}/send`,
+    null,
+    null
+  );
+
+  return {
+    draftId: draft.id,
+    conversationId: originalMessage.conversationId || null,
+    attachments: fileAttachments.length
+  };
+}
 
 // ============== CORE EMAIL CRUD ==============
 
@@ -93,6 +332,7 @@ async function handleEmail(args) {
 async function listEmails(accessToken, params) {
   const { folderId, maxResults = 10, mailbox } = params;
 
+  if (folderId) validateId(folderId, 'folderId');
   const endpoint = folderId ?
     `${config.getMailboxPrefix(mailbox)}/mailFolders/${folderId}/messages` :
     `${config.getMailboxPrefix(mailbox)}/messages`;
@@ -151,6 +391,7 @@ async function readEmail(accessToken, params) {
       }]
     };
   }
+  validateId(emailId, 'emailId');
 
   // Fetch metadata only — attachments listed without downloading content
   const response = await callGraphAPI(
@@ -224,6 +465,8 @@ async function getAttachment(accessToken, params) {
       }]
     };
   }
+  validateId(emailId, 'emailId');
+  validateId(attachmentId, 'attachmentId');
 
   try {
     // Fetch single attachment with full content
@@ -342,6 +585,13 @@ function cleanupAttachment(params) {
 
 async function sendEmail(accessToken, params) {
   try {
+    const policyError = await enforceMailPolicy('send', params);
+    if (policyError) {
+      return {
+        content: [{ type: "text", text: policyError }]
+      };
+    }
+
     if (!params || typeof params !== 'object') {
       return {
         content: [{
@@ -407,6 +657,11 @@ async function sendEmail(accessToken, params) {
       }
     }
 
+    // Attach files if provided
+    if (params.attachments && params.attachments.length > 0) {
+      message.attachments = buildFileAttachments(params.attachments);
+    }
+
     const sendEndpoint = `${config.getMailboxPrefix(params.mailbox)}/sendMail`;
     await callGraphAPI(
       accessToken,
@@ -419,11 +674,22 @@ async function sendEmail(accessToken, params) {
       null
     );
 
+    const attachCount = message.attachments ? message.attachments.length : 0;
+    const attachMsg = attachCount > 0 ? ` with ${attachCount} attachment(s)` : '';
+    await recordSideEffect('mail.send', 'success', params.mailbox || null, {
+      to: toRecipients,
+      subject: params.subject,
+      attachments: attachCount
+    });
     return {
-      content: [{ type: "text", text: "Email sent successfully!" }]
+      content: [{ type: "text", text: `Email sent successfully${attachMsg}!` }]
     };
   } catch (error) {
     console.error('[EMAIL] Send error:', error.message);
+    await recordSideEffect('mail.send', 'failed', params?.mailbox || null, {
+      error: error.message,
+      subject: params?.subject || null
+    });
     return {
       content: [{ type: "text", text: `Email send error: ${error.message}` }]
     };
@@ -432,6 +698,13 @@ async function sendEmail(accessToken, params) {
 
 async function replyToEmail(accessToken, params) {
   try {
+    const policyError = await enforceMailPolicy('reply', params);
+    if (policyError) {
+      return {
+        content: [{ type: "text", text: policyError }]
+      };
+    }
+
     if (!params || typeof params !== 'object') {
       return {
         content: [{
@@ -449,6 +722,7 @@ async function replyToEmail(accessToken, params) {
         }]
       };
     }
+    validateId(params.emailId, 'emailId');
 
     // Use comment (not message.body) so Graph preserves the quoted original message.
     // message.body replaces the entire reply body, wiping the original.
@@ -483,20 +757,103 @@ async function replyToEmail(accessToken, params) {
       replyPayload.message = messageOverrides;
     }
 
-    const replyEndpoint = `${config.getMailboxPrefix(params.mailbox)}/messages/${params.emailId}/reply`;
-    await callGraphAPI(
-      accessToken,
-      'POST',
-      replyEndpoint,
-      replyPayload,
-      null
-    );
+    const prefix = config.getMailboxPrefix(params.mailbox);
+    const fileAttachments = params.attachments && params.attachments.length > 0
+      ? buildFileAttachments(params.attachments)
+      : [];
+    const hasAttachments = fileAttachments.length > 0;
 
-    return {
-      content: [{ type: "text", text: "Reply sent successfully! The reply is threaded under the original email." }]
-    };
+    try {
+      // If attachments are provided, use createReply -> addAttachments -> send
+      // because the /reply endpoint doesn't support inline attachments.
+      if (hasAttachments) {
+        const replyAction = params.replyAll ? 'createReplyAll' : 'createReply';
+        const draft = await callGraphAPI(
+          accessToken,
+          'POST',
+          `${prefix}/messages/${params.emailId}/${replyAction}`,
+          replyPayload,
+          null
+        );
+
+        for (const att of fileAttachments) {
+          await callGraphAPI(
+            accessToken,
+            'POST',
+            `${prefix}/messages/${draft.id}/attachments`,
+            att,
+            null
+          );
+        }
+
+        await callGraphAPI(
+          accessToken,
+          'POST',
+          `${prefix}/messages/${draft.id}/send`,
+          null,
+          null
+        );
+
+        await recordSideEffect('mail.reply', 'success', params.mailbox || null, {
+          emailId: params.emailId,
+          replyAll: !!params.replyAll,
+          attachments: fileAttachments.length
+        });
+        return {
+          content: [{ type: "text", text: `Reply sent successfully with ${fileAttachments.length} attachment(s)! The reply is threaded under the original email.` }]
+        };
+      }
+
+      const replyEndpoint = params.replyAll
+        ? `${prefix}/messages/${params.emailId}/replyAll`
+        : `${prefix}/messages/${params.emailId}/reply`;
+      await callGraphAPI(
+        accessToken,
+        'POST',
+        replyEndpoint,
+        replyPayload,
+        null
+      );
+
+      await recordSideEffect('mail.reply', 'success', params.mailbox || null, {
+        emailId: params.emailId,
+        replyAll: !!params.replyAll,
+        attachments: 0
+      });
+      return {
+        content: [{ type: "text", text: "Reply sent successfully! The reply is threaded under the original email." }]
+      };
+    } catch (actionError) {
+      if (!isReplyActionRoutingError(actionError)) {
+        throw actionError;
+      }
+
+      const fallback = await sendReplyViaDraftFallback(accessToken, params, prefix, fileAttachments);
+
+      await recordSideEffect('mail.reply', 'success', params.mailbox || null, {
+        emailId: params.emailId,
+        replyAll: !!params.replyAll,
+        attachments: fallback.attachments,
+        fallback: 'draft-send',
+        draftId: fallback.draftId,
+        conversationId: fallback.conversationId
+      });
+
+      const attachMsg = fallback.attachments > 0 ? ` with ${fallback.attachments} attachment(s)` : '';
+      return {
+        fallback: 'draft-send',
+        content: [{
+          type: "text",
+          text: `Reply sent successfully${attachMsg} via fallback: draft-send.`
+        }]
+      };
+    }
   } catch (error) {
     console.error('[EMAIL] Reply error:', error.message);
+    await recordSideEffect('mail.reply', 'failed', params?.mailbox || null, {
+      error: error.message,
+      emailId: params?.emailId || null
+    });
     return {
       content: [{ type: "text", text: `Email reply error: ${error.message}` }]
     };
@@ -558,6 +915,13 @@ ul, ol {
 
 async function createDraft(accessToken, params) {
   try {
+    const policyError = await enforceMailPolicy('draft', params);
+    if (policyError) {
+      return {
+        content: [{ type: "text", text: policyError }]
+      };
+    }
+
     if (!params.subject && !params.body && !params.to) {
       return {
         content: [{
@@ -601,6 +965,11 @@ async function createDraft(accessToken, params) {
       }));
     }
 
+    // Attach files if provided
+    if (params.attachments && params.attachments.length > 0) {
+      draftMessage.attachments = buildFileAttachments(params.attachments);
+    }
+
     const response = await callGraphAPI(
       accessToken,
       'POST',
@@ -609,14 +978,25 @@ async function createDraft(accessToken, params) {
       null
     );
 
+    const attachCount = draftMessage.attachments ? draftMessage.attachments.length : 0;
+    const attachMsg = attachCount > 0 ? `\nAttachments: ${attachCount}` : '';
+    await recordSideEffect('mail.draft', 'success', params.mailbox || null, {
+      draftId: response.id,
+      subject: response.subject || params.subject || null,
+      attachments: attachCount
+    });
     return {
       content: [{
         type: "text",
-        text: `Draft created successfully!\nDraft ID: ${response.id}\nSubject: ${response.subject || '(No subject)'}`
+        text: `Draft created successfully!\nDraft ID: ${response.id}\nSubject: ${response.subject || '(No subject)'}${attachMsg}`
       }]
     };
   } catch (error) {
     console.error('Error creating draft:', error);
+    await recordSideEffect('mail.draft', 'failed', params?.mailbox || null, {
+      error: error.message,
+      subject: params?.subject || null
+    });
     return {
       content: [{ type: "text", text: `Error creating draft: ${error.message}` }]
     };
@@ -635,6 +1015,7 @@ async function updateDraft(accessToken, params) {
         }]
       };
     }
+    validateId(draftId, 'draftId');
 
     const updateMessage = {};
 
@@ -694,6 +1075,13 @@ async function updateDraft(accessToken, params) {
 
 async function sendDraft(accessToken, params) {
   try {
+    const policyError = await enforceMailPolicy('send_draft', params);
+    if (policyError) {
+      return {
+        content: [{ type: "text", text: policyError }]
+      };
+    }
+
     const { draftId, mailbox } = params;
 
     if (!draftId) {
@@ -704,6 +1092,7 @@ async function sendDraft(accessToken, params) {
         }]
       };
     }
+    validateId(draftId, 'draftId');
 
     await callGraphAPI(
       accessToken,
@@ -713,6 +1102,9 @@ async function sendDraft(accessToken, params) {
       null
     );
 
+    await recordSideEffect('mail.send_draft', 'success', mailbox || null, {
+      draftId
+    });
     return {
       content: [{
         type: "text",
@@ -721,6 +1113,10 @@ async function sendDraft(accessToken, params) {
     };
   } catch (error) {
     console.error('Error sending draft:', error);
+    await recordSideEffect('mail.send_draft', 'failed', params?.mailbox || null, {
+      error: error.message,
+      draftId: params?.draftId || null
+    });
     return {
       content: [{ type: "text", text: `Error sending draft: ${error.message}` }]
     };
@@ -871,7 +1267,7 @@ async function handleMail(args) {
 const emailTools = [
   {
     name: "mail",
-    description: "Unified email management: list, read, send, reply, draft, search, move, folders, rules, categories, and focused inbox",
+    description: "Unified email management: list, read, send, reply, draft, search, move, folders, rules, categories, and focused inbox. Reply auto-falls back to draft-send when Graph reply actions return mailbox move or cross-server 503 routing errors.",
     inputSchema: {
       type: "object",
       properties: {
@@ -908,6 +1304,12 @@ const emailTools = [
           type: "array",
           items: { type: "string" },
           description: "BCC recipients"
+        },
+        replyAll: { type: "boolean", description: "Reply to all recipients (for reply). Default: false. Reply may return fallback: 'draft-send' if Graph reply actions hit mailbox routing errors." },
+        attachments: {
+          type: "array",
+          items: { type: "string" },
+          description: "Local file paths to attach (for send/reply/draft). Files must be < 3 MB each."
         },
         draftId: { type: "string", description: "Draft ID (for update_draft, send_draft)" },
         // Search parameters

@@ -11,7 +11,26 @@ const secureStore = require('./auth/secure-store');
 // MCP Server Auth Helper for Office MCP
 // This server handles the OAuth2 redirect callback from Microsoft
 
+// HTML-escape to prevent XSS when rendering user-controlled values
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 const app = express();
+
+// CORS: only allow requests from the auth server itself
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', `http://localhost:${PORT}`);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
 const PORT = process.env.PORT || 3000;
 const TOKEN_FILE = path.join(os.homedir(), '.office-mcp-tokens.json');
 
@@ -64,7 +83,7 @@ app.get('/auth', (req, res) => {
   // Load environment variables or use config
   const clientId = process.env.OFFICE_CLIENT_ID || '';
   const clientSecret = process.env.OFFICE_CLIENT_SECRET || '';
-  const tenantId = process.env.OFFICE_TENANT_ID || 'common';
+  const tenantId = process.env.OFFICE_TENANT_ID || 'organizations';
   
   // Verify credentials are set
   if (!clientId || !clientSecret) {
@@ -94,9 +113,9 @@ app.get('/auth', (req, res) => {
     return;
   }
   
-  // Get client_id from query parameters or use the default
-  const requestedClientId = req.query.client_id || clientId;
-  
+  // Always use the configured client ID (never accept from query params)
+  const requestedClientId = clientId;
+
   // Generate a secure state parameter
   const state = crypto.randomBytes(16).toString('hex');
   authCodes.set('state', state);
@@ -137,8 +156,8 @@ app.get('/auth/callback', async (req, res) => {
         <body>
           <h1>Authentication Error</h1>
           <div class="error">
-            <p><strong>Error:</strong> ${error}</p>
-            <p><strong>Description:</strong> ${error_description || 'No description provided'}</p>
+            <p><strong>Error:</strong> ${escapeHtml(error)}</p>
+            <p><strong>Description:</strong> ${escapeHtml(error_description) || 'No description provided'}</p>
           </div>
           <p><a href="/">Back to home</a></p>
         </body>
@@ -212,7 +231,7 @@ app.get('/auth/callback', async (req, res) => {
             <h1>Token Exchange Error</h1>
             <div class="error">
               <p>Failed to exchange authorization code for tokens.</p>
-              <p>Error: ${error.message}</p>
+              <p>Error: ${escapeHtml(error.message)}</p>
             </div>
           </body>
         </html>
@@ -220,31 +239,12 @@ app.get('/auth/callback', async (req, res) => {
     });
 });
 
-// API endpoint to get the stored auth code
-app.get('/api/auth-code', (req, res) => {
-  const code = authCodes.get('code');
-  if (code) {
-    authCodes.delete('code'); // Clear after retrieving
-    res.json({ code });
-  } else {
-    res.status(404).json({ error: 'No authorization code available' });
-  }
-});
-
-// API endpoint to set the state parameter
-app.post('/api/state', express.json(), (req, res) => {
-  const { state } = req.body;
-  authCodes.set('state', state);
-  res.json({ status: 'ok' });
-});
-
-// API endpoint to check server status
+// API endpoint to check server status (read-only, localhost-only)
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'running',
     port: PORT,
-    tokenFileExists: fs.existsSync(TOKEN_FILE),
-    hasPendingCode: authCodes.has('code')
+    tokenFileExists: fs.existsSync(TOKEN_FILE)
   });
 });
 
@@ -253,7 +253,7 @@ function exchangeCodeForTokens(code) {
   return new Promise((resolve, reject) => {
     const clientId = process.env.OFFICE_CLIENT_ID || '';
     const clientSecret = process.env.OFFICE_CLIENT_SECRET || '';
-    const tenantId = process.env.OFFICE_TENANT_ID || 'common';
+    const tenantId = process.env.OFFICE_TENANT_ID || 'organizations';
     
     const postData = new URLSearchParams({
       client_id: clientId,
