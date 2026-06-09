@@ -10,8 +10,31 @@ const RETRY_CONFIG = {
   maxRetries: 3,
   retryDelay: 1000, // Start with 1 second
   retryableErrors: [429, 503, 504], // Rate limit and service unavailable
-  exponentialBackoff: true
+  exponentialBackoff: true,
+  maxRetryDelay: 60000 // Cap any single backoff/Retry-After wait at 60s
 };
+
+// Hard ceiling on pages walked by fetchAllGraphPages, guards against runaway loops
+const MAX_PAGES = 100;
+
+/**
+ * Parse an HTTP Retry-After header into milliseconds.
+ * Supports both delta-seconds ("120") and HTTP-date forms.
+ * @param {string|undefined} headerValue
+ * @returns {number|null} Milliseconds to wait, or null if unparseable/absent
+ */
+function parseRetryAfter(headerValue) {
+  if (!headerValue) return null;
+  const seconds = Number(headerValue);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+  const dateMs = Date.parse(headerValue);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return null;
+}
 
 // Error message enhancements
 const ERROR_SUGGESTIONS = {
@@ -88,15 +111,20 @@ async function callGraphAPI(accessToken, method, path, data = null, queryParams 
     // Safe logging - only log path without sensitive query params
     console.error(`[GRAPH-API] ${method} ${path.split('?')[0]}`);
 
+    // @odata.nextLink (and other Graph-returned links) are fully-qualified URLs with
+    // $skiptoken already baked in. Follow them verbatim — no re-encoding, no prefix,
+    // no re-applying the original query params.
+    const isAbsoluteUrl = typeof path === 'string' && /^https?:\/\//i.test(path);
+
     // Clone queryParams to avoid mutating caller's object
     const params = { ...queryParams };
 
     // Encode path using Graph-aware encoder
-    const encodedPath = encodeGraphPath(path);
-    
+    const encodedPath = isAbsoluteUrl ? path : encodeGraphPath(path);
+
     // Build query string from parameters with special handling for OData filters
     let queryString = '';
-    if (params && Object.keys(params).length > 0) {
+    if (!isAbsoluteUrl && params && Object.keys(params).length > 0) {
       // Handle $filter parameter specially to ensure proper URI encoding
       const filter = params.$filter;
       if (filter) {
@@ -130,7 +158,7 @@ async function callGraphAPI(accessToken, method, path, data = null, queryParams 
       }
     }
 
-    const url = `${config.GRAPH_API_ENDPOINT}${encodedPath}${queryString}`;
+    const url = isAbsoluteUrl ? path : `${config.GRAPH_API_ENDPOINT}${encodedPath}${queryString}`;
     // Only log full URL in verbose debug mode (may contain sensitive data)
     if (process.env.DEBUG_VERBOSE === 'true') {
       console.error(`[GRAPH-API] Full URL: ${url}`);
@@ -217,12 +245,18 @@ async function callGraphAPI(accessToken, method, path, data = null, queryParams 
                               retryCount < RETRY_CONFIG.maxRetries;
             
             if (shouldRetry) {
-              // Calculate delay with exponential backoff
-              const delay = RETRY_CONFIG.exponentialBackoff 
+              // Honor server-provided Retry-After (common on 429/503); otherwise back off exponentially.
+              const retryAfterMs = parseRetryAfter(res.headers['retry-after']);
+              const backoffMs = RETRY_CONFIG.exponentialBackoff
                 ? RETRY_CONFIG.retryDelay * Math.pow(2, retryCount)
                 : RETRY_CONFIG.retryDelay;
-              
-              console.error(`Request failed with status ${res.statusCode}. Retrying in ${delay}ms... (Attempt ${retryCount + 1}/${RETRY_CONFIG.maxRetries})`);
+              const delay = Math.min(
+                retryAfterMs != null ? retryAfterMs : backoffMs,
+                RETRY_CONFIG.maxRetryDelay
+              );
+
+              const reason = retryAfterMs != null ? `Retry-After=${retryAfterMs}ms` : 'exponential backoff';
+              console.error(`Request failed with status ${res.statusCode}. Retrying in ${delay}ms (${reason})... (Attempt ${retryCount + 1}/${RETRY_CONFIG.maxRetries})`);
               
               // Wait and retry
               setTimeout(() => {
@@ -276,6 +310,61 @@ async function callGraphAPI(accessToken, method, path, data = null, queryParams 
   }
 }
 
+/**
+ * Fetch every page of a Graph collection by following @odata.nextLink until it is
+ * absent (or an optional maxResults cap is reached). Each page is fetched through
+ * callGraphAPI, so 429/Retry-After handling and retries apply to every page.
+ *
+ * @param {string} accessToken
+ * @param {string} method - HTTP method for the FIRST page (typically 'GET')
+ * @param {string} path - API path for the first page (relative or absolute)
+ * @param {object} data - Body for the first request (usually null for GET)
+ * @param {object} queryParams - Query params for the first page (e.g. $filter/$select/$top)
+ * @param {object} [options]
+ * @param {number} [options.maxResults=Infinity] - Stop once this many items collected
+ * @param {object} [customHeaders]
+ * @returns {Promise<{ value: object[], pages: number, truncated: boolean }>}
+ */
+async function fetchAllGraphPages(accessToken, method, path, data = null, queryParams = {}, options = {}, customHeaders = {}) {
+  const maxResults = options.maxResults == null ? Infinity : options.maxResults;
+  const results = [];
+  let pages = 0;
+  let truncated = false;
+
+  // First page uses the supplied method/path/queryParams.
+  let response = await callGraphAPI(accessToken, method, path, data, queryParams, customHeaders);
+  pages += 1;
+
+  while (true) {
+    const pageValues = (response && Array.isArray(response.value)) ? response.value : [];
+    for (const item of pageValues) {
+      if (results.length >= maxResults) break;
+      results.push(item);
+    }
+
+    const nextLink = response && response['@odata.nextLink'];
+    if (results.length >= maxResults) {
+      // Hit the cap; note whether more was available so callers can surface it.
+      truncated = !!nextLink || results.length < (response?.value?.length ?? 0);
+      break;
+    }
+    if (!nextLink) break;
+    if (pages >= MAX_PAGES) {
+      console.error(`[GRAPH-API] fetchAllGraphPages hit MAX_PAGES (${MAX_PAGES}); stopping pagination early`);
+      truncated = true;
+      break;
+    }
+
+    // nextLink is an absolute URL with $skiptoken baked in — GET it verbatim.
+    response = await callGraphAPI(accessToken, 'GET', nextLink, null, {}, customHeaders);
+    pages += 1;
+  }
+
+  return { value: results.slice(0, maxResults), pages, truncated };
+}
+
 module.exports = {
-  callGraphAPI
+  callGraphAPI,
+  fetchAllGraphPages,
+  parseRetryAfter
 };

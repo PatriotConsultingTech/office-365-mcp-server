@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { ensureAuthenticated } = require('../auth');
-const { callGraphAPI } = require('../utils/graph-api');
+const { callGraphAPI, fetchAllGraphPages } = require('../utils/graph-api');
 const { safeTool } = require('../utils/errors');
 const config = require('../config');
 
@@ -97,19 +97,17 @@ async function listEmails(accessToken, params) {
     `${config.getMailboxPrefix(mailbox)}/mailFolders/${folderId}/messages` :
     `${config.getMailboxPrefix(mailbox)}/messages`;
 
+  // Unfiltered list: $orderby is valid here. Page size 100, walk @odata.nextLink up to the cap.
   const queryParams = {
-    $top: maxResults,
+    $top: Math.min(maxResults, 100),
     $select: config.EMAIL_SELECT_FIELDS,
     $orderby: 'receivedDateTime desc'
   };
 
-  const response = await callGraphAPI(
-    accessToken,
-    'GET',
-    endpoint,
-    null,
-    queryParams
+  const page = await fetchAllGraphPages(
+    accessToken, 'GET', endpoint, null, queryParams, { maxResults }
   );
+  const response = { value: page.value };
 
   if (!response.value || response.value.length === 0) {
     return {
@@ -732,18 +730,20 @@ async function listDrafts(accessToken, params) {
     const { maxResults = 10, mailbox } = params;
 
     const queryParams = {
-      $top: maxResults,
+      $top: Math.min(maxResults, 100),
       $select: config.EMAIL_SELECT_FIELDS,
       $orderby: 'lastModifiedDateTime desc'
     };
 
-    const response = await callGraphAPI(
+    const page = await fetchAllGraphPages(
       accessToken,
       'GET',
       `${config.getMailboxPrefix(mailbox)}/mailFolders/drafts/messages`,
       null,
-      queryParams
+      queryParams,
+      { maxResults }
     );
+    const response = { value: page.value };
 
     if (!response.value || response.value.length === 0) {
       return {
