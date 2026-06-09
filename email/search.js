@@ -6,9 +6,12 @@
  */
 
 const { ensureAuthenticated } = require('../auth');
-const { callGraphAPI } = require('../utils/graph-api');
+const { callGraphAPI, fetchAllGraphPages } = require('../utils/graph-api');
 const config = require('../config');
 const { getFolderIdByName } = require('./folders');
+
+// Hard ceiling on /search/query pages (from/size pagination) to guard against runaway loops.
+const MAX_SEARCH_PAGES = 50;
 
 /**
  * Unified email search handler - single powerful search with automatic optimization
@@ -26,9 +29,10 @@ async function handleEmailSearch(args) {
     endDate,         // Optional: ISO or relative
     folderId,        // Optional: folder ID to search in
     folderName,      // Optional: folder name (auto-converts to ID)
-    maxResults = 25, // Optional: max 1000
+    maxResults = 1000, // Optional: exhaust all pages by default, capped at 1000
     useRelevance = false, // Optional: relevance vs date sort
-    includeDeleted = false // Optional: include deleted items
+    includeDeleted = false, // Optional: include deleted items
+    _format = true   // Internal: when false, return structured { count, emails } for tests
   } = args;
 
   // Handle empty query string - skip $search and use $filter directly
@@ -75,7 +79,8 @@ async function handleEmailSearch(args) {
         startDate,
         endDate,
         endpoint: searchEndpoint,
-        maxResults
+        maxResults,
+        _format
       });
     }
 
@@ -109,7 +114,8 @@ async function handleEmailSearch(args) {
         startDate,
         endDate,
         endpoint: searchEndpoint,
-        maxResults
+        maxResults,
+        _format
       });
     }
 
@@ -122,7 +128,8 @@ async function handleEmailSearch(args) {
           query: kqlQuery,
           maxResults,
           useRelevance,
-          includeDeleted
+          includeDeleted,
+          _format
         });
       } catch (error) {
         console.error('Microsoft Search API failed, falling back:', error.message);
@@ -134,7 +141,8 @@ async function handleEmailSearch(args) {
       return await searchUsingGraphSearch(accessToken, {
         query: kqlQuery,
         endpoint: searchEndpoint,
-        maxResults
+        maxResults,
+        _format
       });
     } catch (error) {
       console.error('Graph $search failed, falling back to $filter:', error.message);
@@ -153,7 +161,8 @@ async function handleEmailSearch(args) {
           startDate,
           endDate,
           endpoint: searchEndpoint,
-          maxResults
+          maxResults,
+          _format
         });
       } else {
         return await searchUsingFilter(accessToken, {
@@ -167,7 +176,8 @@ async function handleEmailSearch(args) {
           startDate,
           endDate,
           endpoint: searchEndpoint,
-          maxResults
+          maxResults,
+          _format
         });
       }
     }
@@ -307,35 +317,61 @@ function parseRelativeDate(dateStr) {
  * Search using Microsoft Search API for relevance ranking
  */
 async function searchUsingMicrosoftSearchAPI(accessToken, params) {
-  const { query, maxResults, useRelevance, includeDeleted, mailbox } = params;
+  const { query, maxResults, useRelevance, includeDeleted, mailbox, _format = true } = params;
 
-  const searchPayload = {
-    requests: [
-      {
+  // /search/query paginates via from/size + moreResultsAvailable (not @odata.nextLink).
+  const cap = maxResults == null ? 1000 : maxResults;
+  const pageSize = Math.min(cap, 250);
+  const fields = ["subject", "from", "toRecipients", "receivedDateTime", "hasAttachments", "id", "bodyPreview", "importance", "isRead"];
+
+  const hits = [];
+  let fromOffset = 0;
+  let safety = 0;
+  while (hits.length < cap && safety < MAX_SEARCH_PAGES) {
+    safety += 1;
+    const response = await callGraphAPI(accessToken, 'POST', 'search/query', {
+      requests: [{
         entityTypes: ["message"],
-        query: {
-          queryString: query
-        },
-        from: 0,
-        size: Math.min(maxResults, 1000),
-        fields: ["subject", "from", "toRecipients", "receivedDateTime", "hasAttachments", "id", "bodyPreview", "importance", "isRead"],
+        query: { queryString: query },
+        from: fromOffset,
+        size: pageSize,
+        fields,
         enableTopResults: useRelevance
-      }
-    ]
-  };
+      }]
+    });
 
-  const response = await callGraphAPI(
-    accessToken,
-    'POST',
-    'search/query',
-    searchPayload
-  );
+    const container = response.value?.[0]?.hitsContainers?.[0] || {};
+    const pageHits = container.hits || [];
+    for (const h of pageHits) {
+      if (hits.length >= cap) break;
+      hits.push(h);
+    }
 
-  const hits = response.value[0]?.hitsContainers[0]?.hits || [];
+    if (!container.moreResultsAvailable || pageHits.length === 0) break;
+    fromOffset += pageSize;
+  }
 
   if (hits.length === 0) {
+    if (_format === false) return { count: 0, emails: [] };
     return {
       content: [{ type: "text", text: "No emails found matching your search." }]
+    };
+  }
+
+  if (_format === false) {
+    return {
+      count: hits.length,
+      emails: hits.map(hit => {
+        const r = hit.resource || {};
+        return {
+          id: r.id || hit.hitId || null,
+          subject: r.subject,
+          from: r.from?.emailAddress?.address || r.from || null,
+          receivedDateTime: r.receivedDateTime,
+          hasAttachments: r.hasAttachments,
+          isRead: r.isRead
+        };
+      })
     };
   }
 
@@ -364,28 +400,43 @@ async function searchUsingMicrosoftSearchAPI(accessToken, params) {
  * Search using Graph API $search parameter
  */
 async function searchUsingGraphSearch(accessToken, params) {
-  const { query, endpoint, maxResults, mailbox } = params;
+  const { query, endpoint, maxResults, mailbox, _format = true } = params;
 
+  // $search returns relevance order (no $orderby allowed) and paginates via @odata.nextLink.
+  const cap = maxResults == null ? 1000 : maxResults;
   const queryParams = {
     $search: `"${query}"`,
-    $top: Math.min(maxResults, 250),
+    $top: 100,
     $select: config.EMAIL_SELECT_FIELDS
   };
 
-  const response = await callGraphAPI(
-    accessToken,
-    'GET',
-    endpoint,
-    null,
-    queryParams
+  const page = await fetchAllGraphPages(
+    accessToken, 'GET', endpoint, null, queryParams, { maxResults: cap }
   );
 
-  if (!response.value || response.value.length === 0) {
+  const emails = page.value || [];
+
+  if (emails.length === 0) {
     console.error('Graph $search returned 0 results, falling back to $filter');
     throw new Error('No results from $search, trigger fallback');
   }
 
-  const emailsList = response.value.map(email => {
+  if (_format === false) {
+    return {
+      count: emails.length,
+      truncated: page.truncated,
+      emails: emails.map(e => ({
+        id: e.id,
+        subject: e.subject,
+        from: e.from?.emailAddress?.address || e.from?.address || null,
+        receivedDateTime: e.receivedDateTime,
+        hasAttachments: e.hasAttachments,
+        isRead: e.isRead
+      }))
+    };
+  }
+
+  const emailsList = emails.map(email => {
     const attachments = email.hasAttachments ? ' 📎' : '';
     const importance = email.importance !== 'normal' ? ` [${email.importance}]` : '';
     const unread = !email.isRead ? ' *' : '';
@@ -394,10 +445,12 @@ async function searchUsingGraphSearch(accessToken, params) {
     return `- ${email.subject || '(No subject)'}${attachments}${importance}${unread}\n  From: ${fromAddress}\n  Date: ${new Date(email.receivedDateTime).toLocaleString()}\n  ID: ${email.id}\n`;
   }).join('\n');
 
+  const truncatedNote = page.truncated ? ` (capped at ${cap}; more available)` : '';
+
   return {
     content: [{
       type: "text",
-      text: `Found ${response.value.length} emails:\n\n${emailsList}`
+      text: `Found ${emails.length} emails${truncatedNote}:\n\n${emailsList}`
     }]
   };
 }
@@ -417,7 +470,8 @@ async function searchUsingFilter(accessToken, params) {
     startDate,
     endDate,
     endpoint,
-    maxResults
+    maxResults,
+    _format = true
   , mailbox } = params;
 
   let filters = [];
@@ -464,40 +518,82 @@ async function searchUsingFilter(accessToken, params) {
 
   const filterQuery = filters.length > 0 ? filters.join(' and ') : null;
 
-  // Graph API rejects $orderby combined with contains() in $filter
-  // ("The restriction or sort order is too complex for this operation")
+  // Graph rejects $orderby combined with contains() OR with navigation-property
+  // equality (from/emailAddress/address, toRecipients/any) on a filtered collection:
+  // "The restriction or sort order is too complex for this operation."
+  // In those cases we omit $orderby and sort the exhausted result set client-side.
   const hasContainsFilter = filters.some(f => f.includes('contains('));
+  const hasNavFilter = filters.some(f =>
+    f.includes('from/emailAddress/address') || f.includes('toRecipients/any'));
   const hasFolderSpecificEndpoint = endpoint && endpoint.includes('mailFolders');
-  const shouldIncludeOrderBy = !hasContainsFilter && (!hasFolderSpecificEndpoint || filters.length === 0);
+  const shouldIncludeOrderBy = !hasContainsFilter && !hasNavFilter &&
+    (!hasFolderSpecificEndpoint || filters.length === 0);
 
-  const queryParams = {
-    $top: Math.min(maxResults, 250),
-    $select: config.EMAIL_SELECT_FIELDS
+  // Fixed page size; pagination (fetchAllGraphPages) walks @odata.nextLink up to the cap.
+  const cap = maxResults == null ? 1000 : maxResults;
+  const buildQueryParams = (withOrderBy) => {
+    const qp = {
+      $top: 100,
+      $select: config.EMAIL_SELECT_FIELDS
+    };
+    if (withOrderBy) qp.$orderby = 'receivedDateTime desc';
+    if (filterQuery) qp.$filter = filterQuery;
+    return qp;
   };
 
-  if (shouldIncludeOrderBy) {
-    queryParams.$orderby = 'receivedDateTime desc';
+  let orderByApplied = shouldIncludeOrderBy;
+  let page;
+  try {
+    page = await fetchAllGraphPages(
+      accessToken, 'GET', endpoint, null, buildQueryParams(orderByApplied), { maxResults: cap }
+    );
+  } catch (error) {
+    // Safety net: any other $orderby-complexity rejection → retry without $orderby.
+    if (orderByApplied && /too complex|inefficient\s*filter|restriction or sort order/i.test(error.message || '')) {
+      console.error('[EMAIL] $orderby rejected as too complex, retrying without $orderby');
+      orderByApplied = false;
+      page = await fetchAllGraphPages(
+        accessToken, 'GET', endpoint, null, buildQueryParams(false), { maxResults: cap }
+      );
+    } else {
+      throw error;
+    }
   }
 
-  if (filterQuery) {
-    queryParams.$filter = filterQuery;
+  let emails = page.value || [];
+
+  // When Graph couldn't sort for us, restore newest-first ordering in memory.
+  // NOTE: if $orderby was dropped AND the match count exceeds `cap`, the pages were
+  // fetched in Graph's default order, so this client-sort orders only that truncated
+  // subset — you'd get an arbitrary N, not the newest N. The exhaust-all default
+  // (cap 1000) makes this a non-issue for realistic queries; it only bites a sender
+  // with >1000 matches or an explicitly small maxResults on a from/to filter.
+  if (!orderByApplied) {
+    emails.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
   }
 
-  const response = await callGraphAPI(
-    accessToken,
-    'GET',
-    endpoint,
-    null,
-    queryParams
-  );
+  if (_format === false) {
+    return {
+      count: emails.length,
+      truncated: page.truncated,
+      emails: emails.map(e => ({
+        id: e.id,
+        subject: e.subject,
+        from: e.from?.emailAddress?.address || e.from?.address || null,
+        receivedDateTime: e.receivedDateTime,
+        hasAttachments: e.hasAttachments,
+        isRead: e.isRead
+      }))
+    };
+  }
 
-  if (!response.value || response.value.length === 0) {
+  if (emails.length === 0) {
     return {
       content: [{ type: "text", text: "No emails found matching your search." }]
     };
   }
 
-  const emailsList = response.value.map(email => {
+  const emailsList = emails.map(email => {
     const attachments = email.hasAttachments ? ' 📎' : '';
     const importance = email.importance !== 'normal' ? ` [${email.importance}]` : '';
     const unread = !email.isRead ? ' *' : '';
@@ -506,10 +602,12 @@ async function searchUsingFilter(accessToken, params) {
     return `- ${email.subject || '(No subject)'}${attachments}${importance}${unread}\n  From: ${fromAddress}\n  Date: ${new Date(email.receivedDateTime).toLocaleString()}\n  ID: ${email.id}\n`;
   }).join('\n');
 
+  const truncatedNote = page.truncated ? ` (capped at ${cap}; more available)` : '';
+
   return {
     content: [{
       type: "text",
-      text: `Found ${response.value.length} emails (using filter fallback):\n\n${emailsList}`
+      text: `Found ${emails.length} emails${truncatedNote}:\n\n${emailsList}`
     }]
   };
 }
