@@ -25,6 +25,7 @@ async function handleEmailSearch(args) {
     hasAttachments,  // Optional: boolean
     isRead,          // Optional: boolean
     importance,      // Optional: high/normal/low
+    flagged,         // Optional: boolean — true returns only follow-up-flagged messages; false returns only unflagged
     startDate,       // Optional: ISO or relative (7d/1w/1m/1y)
     endDate,         // Optional: ISO or relative
     folderId,        // Optional: folder ID to search in
@@ -76,6 +77,29 @@ async function handleEmailSearch(args) {
         hasAttachments,
         isRead,
         importance,
+        flagged,
+        startDate,
+        endDate,
+        endpoint: searchEndpoint,
+        maxResults,
+        _format
+      });
+    }
+
+    // The flag/flagStatus property is only reliably filterable via $filter on
+    // /messages, not via $search KQL. Route any `flagged` request through $filter
+    // so we get true follow-up-flag results instead of free-text matches on "flag".
+    if (flagged !== undefined) {
+      console.error('flagged filter detected, using $filter directly');
+      return await searchUsingFilter(accessToken, {
+        query,
+        from,
+        to,
+        subject,
+        hasAttachments,
+        isRead,
+        importance,
+        flagged,
         startDate,
         endDate,
         endpoint: searchEndpoint,
@@ -93,6 +117,7 @@ async function handleEmailSearch(args) {
       hasAttachments,
       isRead,
       importance,
+      flagged,
       startDate,
       endDate
     });
@@ -111,6 +136,7 @@ async function handleEmailSearch(args) {
         hasAttachments,
         isRead,
         importance,
+        flagged,
         startDate,
         endDate,
         endpoint: searchEndpoint,
@@ -158,6 +184,7 @@ async function handleEmailSearch(args) {
           hasAttachments,
           isRead,
           importance,
+          flagged,
           startDate,
           endDate,
           endpoint: searchEndpoint,
@@ -173,6 +200,7 @@ async function handleEmailSearch(args) {
           hasAttachments,
           isRead,
           importance,
+          flagged,
           startDate,
           endDate,
           endpoint: searchEndpoint,
@@ -222,6 +250,11 @@ function buildKQLQuery(params) {
   }
   if (params.importance) {
     kql.push(`importance:${params.importance}`);
+  }
+  if (params.flagged !== undefined) {
+    // KQL form (only used if this query is forced through $search). Real flag
+    // semantics live in searchUsingFilter via $filter=flag/flagStatus eq 'flagged'.
+    kql.push(`followupflag:${params.flagged ? 'flagged' : 'notflagged'}`);
   }
 
   if (params.startDate) {
@@ -467,6 +500,7 @@ async function searchUsingFilter(accessToken, params) {
     hasAttachments,
     isRead,
     importance,
+    flagged,
     startDate,
     endDate,
     endpoint,
@@ -504,6 +538,12 @@ async function searchUsingFilter(accessToken, params) {
     filters.push(`importance eq '${importance}'`);
   }
 
+  if (flagged !== undefined) {
+    // flag is a complex property; Graph requires the nav-property form.
+    // Values: 'notFlagged', 'flagged', 'complete'.
+    filters.push(`flag/flagStatus eq '${flagged ? 'flagged' : 'notFlagged'}'`);
+  }
+
   const dateField = 'receivedDateTime';
 
   if (startDate) {
@@ -524,7 +564,9 @@ async function searchUsingFilter(accessToken, params) {
   // In those cases we omit $orderby and sort the exhausted result set client-side.
   const hasContainsFilter = filters.some(f => f.includes('contains('));
   const hasNavFilter = filters.some(f =>
-    f.includes('from/emailAddress/address') || f.includes('toRecipients/any'));
+    f.includes('from/emailAddress/address') ||
+    f.includes('toRecipients/any') ||
+    f.includes('flag/flagStatus'));
   const hasFolderSpecificEndpoint = endpoint && endpoint.includes('mailFolders');
   const shouldIncludeOrderBy = !hasContainsFilter && !hasNavFilter &&
     (!hasFolderSpecificEndpoint || filters.length === 0);

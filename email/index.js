@@ -157,7 +157,7 @@ async function readEmail(accessToken, params) {
     `${config.getMailboxPrefix(mailbox)}/messages/${emailId}`,
     null,
     {
-      $select: 'subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments',
+      $select: 'subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,flag',
       $expand: 'attachments($select=id,name,contentType,size)'
     }
   );
@@ -169,7 +169,15 @@ async function readEmail(accessToken, params) {
     emailContent += `CC: ${response.ccRecipients.map(r => `${r.emailAddress.name} <${r.emailAddress.address}>`).join(', ')}\n`;
   }
   emailContent += `Date: ${new Date(response.receivedDateTime).toLocaleString()}\n`;
-  emailContent += `Has Attachments: ${response.hasAttachments ? 'Yes' : 'No'}\n\n`;
+  emailContent += `Has Attachments: ${response.hasAttachments ? 'Yes' : 'No'}\n`;
+  if (response.flag && response.flag.flagStatus) {
+    emailContent += `Flag Status: ${response.flag.flagStatus}`;
+    if (response.flag.dueDateTime && response.flag.dueDateTime.dateTime) {
+      emailContent += ` (due ${response.flag.dueDateTime.dateTime})`;
+    }
+    emailContent += `\n`;
+  }
+  emailContent += `\n`;
   emailContent += `Body:\n${response.body.content}`;
 
   // List attachment metadata (no download — use get_attachment to download specific files)
@@ -915,6 +923,7 @@ const emailTools = [
         from: { type: "string", description: "Filter by sender email (for search)" },
         hasAttachments: { type: "boolean", description: "Filter by attachments (for search)" },
         isRead: { type: "boolean", description: "Filter by read/unread (for search)" },
+        flagged: { type: "boolean", description: "Filter by follow-up flag (for search). true = only flagged messages; false = only unflagged. Routed through $filter=flag/flagStatus." },
         importance: { type: "string", enum: ["high", "normal", "low"], description: "Filter by importance" },
         startDate: { type: "string", description: "Start date - ISO or relative 7d/1w/1m/1y (for search)" },
         endDate: { type: "string", description: "End date - ISO or relative (for search)" },
