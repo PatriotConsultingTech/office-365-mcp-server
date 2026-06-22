@@ -108,7 +108,12 @@ async function listContacts(accessToken, params) {
       : emails;
     const phoneStr = Array.isArray(phones) ? phones.join(', ') : phones || '';
     
-    return `${index + 1}. ${contact.displayName || contact.givenName + ' ' + contact.surname}
+    // Graceful name fallback — auto-saved contacts often lack displayName/givenName/surname,
+    // which previously rendered as the literal "null null".
+    const fullName = `${contact.givenName || ''} ${contact.surname || ''}`.trim();
+    const name = contact.displayName || fullName || contact.companyName || emailStr || '(no name)';
+
+    return `${index + 1}. ${name}
    Email: ${emailStr || 'N/A'}
    Phone: ${phoneStr || 'N/A'}
    Company: ${contact.companyName || 'N/A'}
@@ -309,8 +314,13 @@ async function getContact(accessToken, params) {
   const homePhones = contact.homePhones || [];
   const addresses = contact.businessAddress || contact.homeAddress || {};
   
+  const fallbackName = contact.displayName
+    || `${contact.givenName || ''} ${contact.surname || ''}`.trim()
+    || contact.companyName
+    || (emails[0] && emails[0].address)
+    || '(no name)';
   let details = `Contact Details:
-Name: ${contact.displayName || contact.givenName + ' ' + contact.surname}
+Name: ${fallbackName}
 Given Name: ${contact.givenName || 'N/A'}
 Surname: ${contact.surname || 'N/A'}
 Middle Name: ${contact.middleName || 'N/A'}
