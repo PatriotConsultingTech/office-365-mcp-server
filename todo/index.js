@@ -26,9 +26,11 @@ async function handleTodo(args) {
     switch (operation) {
       // ---- List operations ----
       case 'list_lists': {
+        // NOTE: /me/todo/lists rejects $select with HTTP 400 ("Invalid request") — a Graph
+        // quirk specific to this collection ($top is fine). The default projection already
+        // returns id/displayName/isOwner/isShared/wellknownListName, so we omit $select.
         const response = await callGraphAPI(accessToken, 'GET', 'me/todo/lists', null, {
-          $top: params.maxResults || 50,
-          $select: 'id,displayName,isOwner,isShared,wellknownListName'
+          $top: params.maxResults || 50
         });
 
         if (!response.value || response.value.length === 0) {
